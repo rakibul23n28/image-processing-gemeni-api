@@ -1,0 +1,22 @@
+# Ignore virtual environment
+myenv/
+
+# Ignore environment variable file
+.env
+
+# Ignore captured images and AI responses
+captured_images/
+
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# VS Code and JetBrains project settings
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
