@@ -7,6 +7,7 @@ import speech_recognition as sr
 import tempfile
 from gtts import gTTS
 from pydub import AudioSegment
+from io import BytesIO
 
 # Load .env variables
 load_dotenv()
@@ -98,18 +99,22 @@ def upload():
         temp_mp3_path = os.path.join(UPLOAD_FOLDER, "temp.mp3")
         tts.save(temp_mp3_path)
 
-        # Convert MP3 to WAV using pydub
+        # Convert MP3 to WAV in-memory
         sound = AudioSegment.from_mp3(temp_mp3_path)
-        tts_wav_path = os.path.join(UPLOAD_FOLDER, "response.wav")
-        sound.export(tts_wav_path, format="wav")
-        print(f"WAV audio saved to {tts_wav_path}")
+        wav_io = BytesIO()
+        sound.export(wav_io, format="wav")
+        wav_io.seek(0)
 
-        # Return WAV file to ESP32
-        return send_file(tts_wav_path, mimetype='audio/wav')
+        print(f"WAV audio length: {len(wav_io.getvalue())} bytes")
+
+        # Return as attachment
+        return send_file(wav_io, mimetype='audio/wav', as_attachment=True, download_name="response.wav")
 
     except Exception as e:
         print("Server error:", e)
         return "Server error", 500
+
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=80)
