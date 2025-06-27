@@ -1,10 +1,12 @@
 import os
-from flask import Flask, request
+from flask import Flask, request, send_file
 from dotenv import load_dotenv
 from google.genai import types
 from google import genai
 import speech_recognition as sr
 import tempfile
+from gtts import gTTS
+from pydub import AudioSegment
 
 # Load .env variables
 load_dotenv()
@@ -38,10 +40,12 @@ def upload():
     # Save the image to disk
     image_path = os.path.join(UPLOAD_FOLDER, image_file.filename)
     image_file.save(image_path)
+    image = types.Part.from_bytes(data=open(image_path, 'rb').read(), mime_type='image/jpeg')
+    print("Image loaded into Gemini Part object")
     print(f"Image saved to {image_path}")
 
     try:
-        # Use delete=False for Windows compatibility
+        # Save audio to temp file for recognition
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio_file:
             temp_audio_path = temp_audio_file.name
             audio_file.save(temp_audio_path)
@@ -49,7 +53,7 @@ def upload():
         with sr.AudioFile(temp_audio_path) as source:
             audio = recognizer.record(source)
 
-        os.remove(temp_audio_path)  # cleanup manually
+        os.remove(temp_audio_path)
 
         # Transcribe audio
         try:
@@ -58,23 +62,50 @@ def upload():
         except sr.UnknownValueError:
             transcript = ""
             print("Speech recognition could not understand audio")
+            return "Could not understand audio", 400
         except sr.RequestError as e:
             print("Speech recognition error:", e)
             return "Speech recognition failed", 500
 
-        # Gemini API call
         response = client.models.generate_content(
-            model="gemini-1.5-flash",  # use 1.5 if supported; change if needed
+            model="gemini-2.5-flash",
             contents=[
-                types.Part.from_data(data=open(image_path, 'rb').read(), mime_type='image/jpeg'),
-                f"Please analyze and improve the following transcription:\n{transcript}"
-            ]
-        )
+            f"""
+            You are assisting a blind person.
+
+            ONLY do ONE task per request. Choose the task based on this transcript:
+
+            '{transcript}'
+
+            Supported tasks (choose ONE):
+
+            1. Emotion detection → Respond with: Gender, Age, Emotion, Description (in 10 words)
+            2. Text recognition → Respond with: Exact text found in the image
+            3. Image captioning → Respond with: A scene description (based on the transcript)
+
+            If no command is clearly detected, just describe the image in less than 50 words.
+            """,
+                    image
+                ]
+            )
+
 
         gemini_text = response.text if hasattr(response, 'text') else str(response)
         print("Gemini API response:", gemini_text)
 
-        return gemini_text, 200
+        # Convert text to MP3 using gTTS
+        tts = gTTS(text=gemini_text, lang='en')
+        temp_mp3_path = os.path.join(UPLOAD_FOLDER, "temp.mp3")
+        tts.save(temp_mp3_path)
+
+        # Convert MP3 to WAV using pydub
+        sound = AudioSegment.from_mp3(temp_mp3_path)
+        tts_wav_path = os.path.join(UPLOAD_FOLDER, "response.wav")
+        sound.export(tts_wav_path, format="wav")
+        print(f"WAV audio saved to {tts_wav_path}")
+
+        # Return WAV file to ESP32
+        return send_file(tts_wav_path, mimetype='audio/wav')
 
     except Exception as e:
         print("Server error:", e)

@@ -10,8 +10,11 @@
 const char* ssid = "Kawcher";
 const char* password = "01970916952";
 
+//const char* ssid = "Redmi Note 13";
+//const char* password = "11112222";
+
 // Server info
-const char* serverHost = "192.168.0.105";  // IP or domain of your server
+const char* serverHost = "192.168.0.104";  // IP or domain of your server
 const int serverPort = 80;
 const char* serverPath = "/upload";
 
@@ -135,16 +138,17 @@ void sendToServer(camera_fb_t* fb) {
   String boundary = "----ESP32FormBoundary";
   String contentType = "multipart/form-data; boundary=" + boundary;
 
+  // Prepare body
   String startRequest = "--" + boundary + "\r\n"
                         "Content-Disposition: form-data; name=\"image\"; filename=\"image.jpg\"\r\n"
                         "Content-Type: image/jpeg\r\n\r\n";
 
   String midRequest = "";
-  uint8_t wavHeaderBuffer[44];
+  uint8_t wavHeader[44];
   if (!audioData.empty()) {
     WAVHeader header;
     fillWavHeader(header, audioData.size());
-    memcpy(wavHeaderBuffer, &header, sizeof(WAVHeader));
+    memcpy(wavHeader, &header, sizeof(WAVHeader));
 
     midRequest = "\r\n--" + boundary + "\r\n"
                  "Content-Disposition: form-data; name=\"audio\"; filename=\"audio.wav\"\r\n"
@@ -153,41 +157,55 @@ void sendToServer(camera_fb_t* fb) {
 
   String endRequest = "\r\n--" + boundary + "--\r\n";
 
-  int totalLen = startRequest.length() + fb->len + midRequest.length() + (audioData.empty() ? 0 : (44 + audioData.size())) + endRequest.length();
+  int totalLen = startRequest.length() + fb->len +
+                 midRequest.length() +
+                 (audioData.empty() ? 0 : (44 + audioData.size())) +
+                 endRequest.length();
 
-  // HTTP headers
+  // Send headers
   String httpRequest = String("POST ") + serverPath + " HTTP/1.1\r\n" +
                        "Host: " + serverHost + "\r\n" +
                        "Content-Type: " + contentType + "\r\n" +
                        "Content-Length: " + String(totalLen) + "\r\n" +
                        "Connection: close\r\n\r\n";
 
-  Serial.println("Sending HTTP request...");
   client.print(httpRequest);
   client.print(startRequest);
   client.write(fb->buf, fb->len);
 
   if (!audioData.empty()) {
     client.print(midRequest);
-    client.write(wavHeaderBuffer, 44);         // WAV header
-    client.write(audioData.data(), audioData.size());  // PCM data
+    client.write(wavHeader, sizeof(wavHeader));
+    client.write(audioData.data(), audioData.size());
   }
 
   client.print(endRequest);
 
-  Serial.println("Data sent, waiting for server response...");
+  Serial.println("Request sent. Waiting for response...");
 
-  unsigned long timeout = millis();
-  while (client.connected() && millis() - timeout < 5000) {
-    while (client.available()) {
-      String line = client.readStringUntil('\n');
-      Serial.println(line);
-      timeout = millis();
+  // --- Skip HTTP headers ---
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r" || line.length() == 0) break;
+  }
+
+  // --- Play WAV audio response directly ---
+  uint8_t buffer[512];
+  size_t bytes_written;
+  unsigned long lastDataTime = millis();
+
+  while (client.connected()) {
+    int len = client.read(buffer, sizeof(buffer));
+    if (len > 0) {
+      i2s_write(I2S_PORT, buffer, len, &bytes_written, portMAX_DELAY);
+      lastDataTime = millis();
+    } else if (millis() - lastDataTime > 2000) {
+      break;  // no data for 2 seconds, assume done
     }
   }
 
   client.stop();
-  Serial.println("Connection closed.");
+  Serial.println("Audio response complete.");
 }
 
 void setup() {
@@ -231,32 +249,24 @@ void setup() {
   setupI2SMic();
   Serial.println("Setup complete.");
 }
-
 void loop() {
-  static bool lastButtonState = HIGH;
-  static unsigned long lastDebounceTime = 0;
-  const unsigned long debounceDelay = 50;
+  static unsigned long lastTriggerTime = 0;
+  const unsigned long interval = 60000; // 1 minute
 
-  int reading = digitalRead(buttonPin);
+  if (millis() - lastTriggerTime >= interval || lastTriggerTime == 0) {
+    lastTriggerTime = millis();
 
-  if (reading != lastButtonState) {
-    lastDebounceTime = millis();
-  }
+    Serial.println("Triggering image + audio capture and upload...");
 
-  if ((millis() - lastDebounceTime) > debounceDelay) {
-    if (reading == LOW && lastButtonState == HIGH) {
-      Serial.println("Button pressed!");
+    connectWiFi();
 
-      connectWiFi();
-      camera_fb_t* fb = captureImage();
-      if (fb) {
-        recordAudio();
-        sendToServer(fb);
-        esp_camera_fb_return(fb);
-      }
+    camera_fb_t* fb = captureImage();
+    if (fb) {
+      recordAudio();
+      sendToServer(fb);
+      esp_camera_fb_return(fb);
     }
+
+    Serial.println("Waiting for next cycle...");
   }
-
-  lastButtonState = reading;
 }
-
