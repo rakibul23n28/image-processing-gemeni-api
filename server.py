@@ -5,9 +5,7 @@ from google.genai import types
 from google import genai
 import speech_recognition as sr
 import tempfile
-from gtts import gTTS
-from pydub import AudioSegment
-from io import BytesIO
+import pyttsx3
 
 # Load .env variables
 load_dotenv()
@@ -71,49 +69,41 @@ def upload():
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=[
-            f"""
-            You are assisting a blind person.
+                f"""
+                You are assisting a blind person.
 
-            ONLY do ONE task per request. Choose the task based on this transcript:
+                ONLY do ONE task per request. Choose the task based on this transcript:
 
-            '{transcript}'
+                '{transcript}'
 
-            Supported tasks (choose ONE):
+                Supported tasks (choose ONE):
 
-            1. Emotion detection → Respond with: Gender, Age, Emotion, Description (in 10 words)
-            2. Text recognition → Respond with: Exact text found in the image
-            3. Image captioning → Respond with: A scene description (based on the transcript)
+                1. Emotion detection → Respond with: Gender, Age, Emotion, Description (in 10 words)
+                2. Text recognition → Respond with: Exact text found in the image
+                3. Image captioning → Respond with: A scene description (based on the transcript)
 
-            If no command is clearly detected, just describe the image in less than 50 words.
-            """,
-                    image
-                ]
-            )
-
+                If no command is clearly detected, just describe the image in less than 50 words.
+                """,
+                image
+            ]
+        )
 
         gemini_text = response.text if hasattr(response, 'text') else str(response)
         print("Gemini API response:", gemini_text)
 
-        # Convert text to MP3 using gTTS
-        tts = gTTS(text=gemini_text, lang='en')
-        temp_mp3_path = os.path.join(UPLOAD_FOLDER, "temp.mp3")
-        tts.save(temp_mp3_path)
+        # Convert Gemini text to speech using pyttsx3 and save as WAV
+        engine = pyttsx3.init()
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            wav_path = tf.name
+        engine.save_to_file(gemini_text, wav_path)
+        engine.runAndWait()
 
-        # Convert MP3 to WAV in-memory
-        sound = AudioSegment.from_mp3(temp_mp3_path)
-        wav_io = BytesIO()
-        sound.export(wav_io, format="wav")
-        wav_io.seek(0)
-
-        print(f"WAV audio length: {len(wav_io.getvalue())} bytes")
-
-        # Return as attachment
-        return send_file(wav_io, mimetype='audio/wav', as_attachment=True, download_name="response.wav")
+        print(f"WAV file generated at: {wav_path}")
+        return send_file(wav_path, mimetype='audio/wav', as_attachment=True, download_name="response.wav")
 
     except Exception as e:
         print("Server error:", e)
         return "Server error", 500
-
 
 
 if __name__ == '__main__':
