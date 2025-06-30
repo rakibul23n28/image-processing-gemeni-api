@@ -1,18 +1,18 @@
+from email.mime import audio
 import os
+import tempfile
+import pyttsx3
+import speech_recognition as sr
 from flask import Flask, request, send_file
 from dotenv import load_dotenv
 from google.genai import types
 from google import genai
-import speech_recognition as sr
-import tempfile
-import pyttsx3
+from pydub import AudioSegment
 
-# Load .env variables
+# Load environment variables from .env
 load_dotenv()
 
 app = Flask(__name__)
-
-# Upload directory
 UPLOAD_FOLDER = './uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
@@ -21,7 +21,7 @@ api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
     raise ValueError("GEMINI_API_KEY not set in .env")
 
-# Gemini and speech recognizer setup
+# Setup Gemini client and recognizer
 client = genai.Client(api_key=api_key)
 recognizer = sr.Recognizer()
 
@@ -36,15 +36,13 @@ def upload():
     print(f"Received audio file: {audio_file.filename}")
     print(f"Received image file: {image_file.filename}")
 
-    # Save the image to disk
+    # Save image
     image_path = os.path.join(UPLOAD_FOLDER, image_file.filename)
     image_file.save(image_path)
     image = types.Part.from_bytes(data=open(image_path, 'rb').read(), mime_type='image/jpeg')
-    print("Image loaded into Gemini Part object")
-    print(f"Image saved to {image_path}")
 
     try:
-        # Save audio to temp file for recognition
+        # Save audio to temporary file for transcription
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio_file:
             temp_audio_path = temp_audio_file.name
             audio_file.save(temp_audio_path)
@@ -59,13 +57,12 @@ def upload():
             transcript = recognizer.recognize_google(audio, language='en-US')
             print("Transcribed text:", transcript)
         except sr.UnknownValueError:
-            transcript = ""
-            print("Speech recognition could not understand audio")
             return "Could not understand audio", 400
         except sr.RequestError as e:
             print("Speech recognition error:", e)
             return "Speech recognition failed", 500
 
+        # Generate Gemini response
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=[
@@ -91,20 +88,34 @@ def upload():
         gemini_text = response.text if hasattr(response, 'text') else str(response)
         print("Gemini API response:", gemini_text)
 
-        # Convert Gemini text to speech using pyttsx3 and save as WAV
+        # Convert Gemini response text to speech with pyttsx3
         engine = pyttsx3.init()
+        engine.setProperty('rate', 150)  # Adjust speech rate if needed
+
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
             wav_path = tf.name
+
         engine.save_to_file(gemini_text, wav_path)
         engine.runAndWait()
 
-        print(f"WAV file generated at: {wav_path}")
-        return send_file(wav_path, mimetype='audio/wav', as_attachment=True, download_name="response.wav")
+        # Force mono 16-bit PCM @ 16kHz using pydub
+        audio = AudioSegment.from_wav(wav_path)
+        audio = audio.set_channels(1).set_sample_width(2).set_frame_rate(16000)
+        
+        print(f"Channels: {audio.channels}")
+        print(f"Sample Width: {audio.sample_width * 8} bits")
+        print(f"Frame Rate: {audio.frame_rate} Hz")
+
+
+        mono_path = wav_path.replace(".wav", "_mono.wav")
+        audio.export(mono_path, format="wav")
+
+        print(f"Mono WAV file saved at: {mono_path}")
+        return send_file(mono_path, mimetype='audio/wav', as_attachment=True, download_name="response.wav")
 
     except Exception as e:
         print("Server error:", e)
         return "Server error", 500
-
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=80)

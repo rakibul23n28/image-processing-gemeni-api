@@ -8,10 +8,15 @@
 
 #define BUTTON_PIN 21
 
-const char* ssid = "Kawcher";
-const char* password = "01970916952";
+//const char* ssid = "UIU-STUDENT";
+//const char* password = "12345678";
+// const char* ssid = "Redmi 10C";
+// const char* password = "zeff1952";
+ const char* ssid = "Kawcher";
+ const char* password = "01970916952";
 
-const char* serverHost = "192.168.0.104";
+ const char* serverHost = "192.168.0.104";
+//const char* serverHost = "10.15.50.199";
 const int serverPort = 80;
 const char* serverPath = "/upload";
 
@@ -24,9 +29,11 @@ const char* serverPath = "/upload";
 #define I2S_SCK         41
 #define I2S_PORT        I2S_NUM_0
 
-#define I2S_OUT_DOUT    35
-#define I2S_OUT_BCLK    36
-#define I2S_OUT_LRC     37
+
+#define I2S_OUT_DOUT 13 // Data Out (DIN)
+#define I2S_OUT_BCLK 14 // Bit Clock
+#define I2S_OUT_LRC  15 // Left-Right Clock
+
 #define I2S_PORT_OUT    I2S_NUM_1
 
 #define MAX_AUDIO_SIZE  (SAMPLE_RATE * 2 * RECORD_SECONDS) // 2 bytes per sample (16-bit)
@@ -59,15 +66,26 @@ void fillWavHeader(WAVHeader &header, uint32_t dataSize) {
   header.blockAlign = header.numChannels * header.bitsPerSample / 8;
 }
 
+
+// ---------------- WIFI CONNECT --------------------
 void connectWiFi() {
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+  Serial.print("Connecting to WiFi");
+  unsigned long startAttemptTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
     Serial.print(".");
+    delay(500);
   }
-  Serial.println("\nWiFi connected. IP: " + WiFi.localIP().toString());
+  Serial.println(WiFi.status() == WL_CONNECTED ? "\nWiFi connected!" : "\nFailed to connect.");
 }
 
+bool ensureWiFiConnected() {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+    return WiFi.status() == WL_CONNECTED;
+  }
+  return true;
+}
 void setupI2SMic() {
   i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
@@ -103,6 +121,12 @@ void setupI2SMic() {
   i2s_zero_dma_buffer(I2S_PORT);
   Serial.println("I2S Mic driver installed.");
 }
+//
+//#define I2S_OUT_DOUT 13 // Data Out (DIN)
+//#define I2S_OUT_BCLK 14 // Bit Clock
+//#define I2S_OUT_LRC  15 // Left-Right Clock
+//
+//#define I2S_PORT_OUT    I2S_NUM_1
 
 void setupI2SOutput() {
   i2s_config_t i2s_config_out = {
@@ -140,6 +164,22 @@ void setupI2SOutput() {
   Serial.println("I2S Output driver installed.");
 }
 
+void cleanupBuffers(camera_fb_t* fb) {
+  if (fb) {
+    esp_camera_fb_return(fb);
+  }
+
+  if (responseAudio) {
+    free(responseAudio);
+    responseAudio = nullptr;
+    responseAudioLen = 0;
+  }
+
+  memset(audioBuffer, 0, audioLen);
+  audioLen = 0;
+}
+
+
 void recordAudio() {
   Serial.println("Recording audio...");
   uint8_t buffer[I2S_READ_LEN];
@@ -172,46 +212,31 @@ camera_fb_t* captureImage() {
   return fb;
 }
 
-void sendToServer(camera_fb_t* fb) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected! Attempting to reconnect...");
-    connectWiFi(); // Try to reconnect
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("Failed to reconnect to WiFi. Aborting send.");
-        if (fb) esp_camera_fb_return(fb); // Free camera buffer if not sent
-        return;
-    }
-  }
-
-  WiFiClient client;
-  if (!client.connect(serverHost, serverPort)) {
-    Serial.println("Connection to server failed");
-    if (fb) esp_camera_fb_return(fb); // Free camera buffer if not sent
-    return;
-  }
-
+// ---------------- MULTIPART REQUEST --------------------
+void sendMultipartRequest(WiFiClient &client, camera_fb_t* fb) {
   String boundary = "----ESP32FormBoundary";
   String contentType = "multipart/form-data; boundary=" + boundary;
 
-  String startRequest = "--" + boundary + "\r\n"
-                        "Content-Disposition: form-data; name=\"image\"; filename=\"image.jpg\"\r\n"
-                        "Content-Type: image/jpeg\r\n\r\n";
+  String partImageHeader = "--" + boundary + "\r\n" +
+                           "Content-Disposition: form-data; name=\"image\"; filename=\"image.jpg\"\r\n" +
+                           "Content-Type: image/jpeg\r\n\r\n";
 
-  String midRequest = "\r\n--" + boundary + "\r\n"
-                      "Content-Disposition: form-data; name=\"audio\"; filename=\"audio.wav\"\r\n"
-                      "Content-Type: audio/wav\r\n\r\n";
+  String partAudioHeader = "\r\n--" + boundary + "\r\n" +
+                           "Content-Disposition: form-data; name=\"audio\"; filename=\"audio.wav\"\r\n" +
+                           "Content-Type: audio/wav\r\n\r\n";
 
-  String endRequest = "\r\n--" + boundary + "--\r\n";
+  String closingBoundary = "\r\n--" + boundary + "--\r\n";
 
+  // Build WAV header for raw PCM data
   WAVHeader wavHeader;
   fillWavHeader(wavHeader, audioLen);
-  uint8_t headerBytes[sizeof(WAVHeader)]; // Use sizeof(WAVHeader)
+  uint8_t headerBytes[sizeof(WAVHeader)];
   memcpy(headerBytes, &wavHeader, sizeof(WAVHeader));
 
-  // Total HTTP body length
-  int totalLen = startRequest.length() + fb->len +
-                 midRequest.length() + sizeof(headerBytes) + audioLen +
-                 endRequest.length();
+  // Calculate total content length
+  int totalLen = partImageHeader.length() + fb->len +
+                 partAudioHeader.length() + sizeof(headerBytes) + audioLen +
+                 closingBoundary.length();
 
   String httpRequest = String("POST ") + serverPath + " HTTP/1.1\r\n" +
                        "Host: " + serverHost + "\r\n" +
@@ -219,122 +244,200 @@ void sendToServer(camera_fb_t* fb) {
                        "Content-Length: " + String(totalLen) + "\r\n" +
                        "Connection: close\r\n\r\n";
 
-  // === Send the request ===
+  // Send request header
   client.print(httpRequest);
-  client.print(startRequest);
+
+  // Send image part
+  client.print(partImageHeader);
   client.write(fb->buf, fb->len);
-  client.print(midRequest);
+  client.print("\r\n");  // <-- important! Ends image data
+
+  // Send audio part
+  client.print(partAudioHeader);
   client.write(headerBytes, sizeof(headerBytes));
   client.write(audioBuffer, audioLen);
-  client.print(endRequest);
 
-  Serial.println("Data sent. Waiting for response...");
+  // Send closing boundary
+  client.print(closingBoundary);
 
-  // Free camera buffer immediately after sending
-  esp_camera_fb_return(fb);
-  
-  // === Read and print status line ===
+  Serial.println("Request sent. Waiting for response...");
+}
+
+
+// ---------------- SERVER RESPONSE --------------------
+void readServerResponse(WiFiClient &client) {
+  Serial.println("Reading server response...");
+
+  // Step 1: Read and print status line
   String statusLine = client.readStringUntil('\n');
-  Serial.println("Status line: " + statusLine);
+  Serial.println("Status: " + statusLine);
 
-  // === Read headers ===
-  String headerLine;
-  while (true) {
-    headerLine = client.readStringUntil('\n');
-    if (headerLine == "\r" || headerLine.length() == 0) break;
-    Serial.println("Header: " + headerLine);
-  }
-
-  // === Read response body ===
-  responseAudioLen = 0;
-  size_t capacity = 8192; // Initial capacity
-  if (responseAudio) {
-    free(responseAudio);
-    responseAudio = nullptr;
-  }
-  responseAudio = (uint8_t*)malloc(capacity);
-  if (!responseAudio) {
-    Serial.println("Failed to allocate memory for response audio (initial)");
-    responseAudioLen = 0; // Ensure length is zero on failure
-    return;
-  }
-
-  unsigned long lastReceive = millis();
-  const unsigned long timeout = 10000; // Increased timeout for response reception
-
-  while (client.connected() || client.available()) {
-    while (client.available()) {
-      if (responseAudioLen >= capacity) {
-        capacity *= 2; // Double capacity
-        Serial.printf("Reallocating response audio buffer to %u bytes\n", capacity);
-        uint8_t* newBuffer = (uint8_t*)realloc(responseAudio, capacity);
-        if (!newBuffer) {
-          Serial.println("Failed to reallocate buffer for response audio");
-          free(responseAudio);
-          responseAudio = nullptr;
-          responseAudioLen = 0;
-          client.stop(); // Stop client to prevent further attempts
-          return;
-        }
-        responseAudio = newBuffer;
-      }
-      int c = client.read();
-      if (c < 0) break; // No more data
-      responseAudio[responseAudioLen++] = (uint8_t)c;
-      lastReceive = millis();
-    }
-    if (millis() - lastReceive > timeout) {
-      Serial.println("Response read timeout - no more data for a while.");
+  // Step 2: Skip HTTP headers by detecting "\r\n\r\n"
+  String headers = "";
+  while (client.connected()) {
+    char c = client.read();
+    if (c < 0) break;
+    headers += c;
+    if (headers.endsWith("\r\n\r\n")) {
+      Serial.println("[INFO] End of HTTP headers.");
       break;
     }
-    yield(); // Yield to prevent watchdog during long receive
   }
 
-  client.stop();
-  Serial.printf("Audio response received. Size: %u bytes\n", responseAudioLen);
-
-  // === Playback response in chunks ===
-  if (responseAudio && responseAudioLen > 0) {
-    Serial.printf("Free PSRAM before playback: %u bytes\n", ESP.getFreePsram());
-    setupI2SOutput();
-
-    size_t written = 0;
-    const size_t chunkSize = 2048; // Increased chunk size for potentially better performance
-    Serial.println("Starting audio playback...");
-    for (size_t i = 0; i < responseAudioLen; i += written) { // Iterate by written bytes
-      size_t toWrite = min(chunkSize, responseAudioLen - i);
-      esp_err_t err = i2s_write(I2S_PORT_OUT, responseAudio + i, toWrite, &written, portMAX_DELAY);
-      if (err != ESP_OK) {
-        Serial.printf("i2s_write error at offset %u: %d\n", i, err);
-        break;
-      }
-      if (written == 0) { // If no bytes were written, something is wrong, prevent infinite loop
-          Serial.println("i2s_write wrote 0 bytes, stopping playback.");
-          break;
-      }
-      yield(); // Crucial for watchdog
-      // Small delay might be helpful, but too much will cause gaps
-      // delay(1); // Consider reducing or removing if it causes gaps
-    }
-
-    Serial.println("Playback loop finished.");
-    i2s_driver_uninstall(I2S_PORT_OUT);
-    Serial.println("I2S Output driver uninstalled.");
-  } else {
-    Serial.println("No audio response or response is empty to play.");
-  }
-
-  // Free audio buffer
+  // Step 3: Prepare response audio buffer
   if (responseAudio) {
     free(responseAudio);
     responseAudio = nullptr;
     responseAudioLen = 0;
-    Serial.println("Response audio buffer freed.");
   }
-  // Clear mic audio buffer after sending
+
+  size_t capacity = 8192;
+  responseAudio = (uint8_t*)malloc(capacity);
+  if (!responseAudio) {
+    Serial.println("[ERROR] Memory allocation failed for response audio.");
+    return;
+  }
+
+  // Step 4: Read binary audio body
+  unsigned long lastReceive = millis();
+  const unsigned long timeout = 10000;
+
+  while (client.connected() || client.available()) {
+    while (client.available()) {
+      if (responseAudioLen >= capacity) {
+        capacity *= 2;
+        uint8_t* newBuffer = (uint8_t*)realloc(responseAudio, capacity);
+        if (!newBuffer) {
+          Serial.println("[ERROR] Realloc failed for response audio.");
+          free(responseAudio);
+          responseAudio = nullptr;
+          responseAudioLen = 0;
+          return;
+        }
+        responseAudio = newBuffer;
+      }
+
+      int c = client.read();
+      if (c < 0) break;
+      responseAudio[responseAudioLen++] = (uint8_t)c;
+      lastReceive = millis();
+    }
+
+    if (millis() - lastReceive > timeout) {
+      Serial.println("[ERROR] Read timeout.");
+      break;
+    }
+
+    yield();  // avoid watchdog reset
+  }
+
+  client.stop();
+  Serial.printf("Received %u bytes of audio\n", responseAudioLen);
+}
+
+
+
+// ---------------- PLAY RESPONSE --------------------
+void playWavResponse() {
+  Serial.printf("Total responseAudioLen = %u bytes\n", responseAudioLen);
+
+  // Check if response is at least large enough to contain a WAV header
+  if (responseAudioLen <= 44) {
+    Serial.println("[ERROR] Response too short to contain WAV header.");
+    free(responseAudio);
+    responseAudio = nullptr;
+    responseAudioLen = 0;
+    return;
+  }
+
+  // Print first 16 bytes of the response
+  Serial.println("First 16 bytes of responseAudio:");
+  for (int i = 0; i < 16 && i < responseAudioLen; i++) {
+    Serial.printf("%02X ", responseAudio[i]);
+  }
+  Serial.println();
+
+  // Check for "RIFF" magic header
+  if (!(responseAudio[0] == 'R' && responseAudio[1] == 'I' &&
+        responseAudio[2] == 'F' && responseAudio[3] == 'F')) {
+    Serial.print("[ERROR] WAV header missing or invalid: Expected 'RIFF' but got: ");
+    for (int i = 0; i < 4 && i < responseAudioLen; i++) {
+      Serial.print((char)responseAudio[i]);
+    }
+    Serial.println();
+    free(responseAudio);
+    responseAudio = nullptr;
+    responseAudioLen = 0;
+    return;
+  }
+
+  Serial.println("WAV header is valid. Beginning playback...");
+
+  setupI2SOutput();
+
+  const size_t wavHeaderSize = 44;
+const size_t chunkSize = 2048;
+
+size_t offset = wavHeaderSize;
+
+while (offset < responseAudioLen) {
+  size_t toWrite = min(chunkSize, responseAudioLen - offset);
+  size_t written = 0;
+  esp_err_t err = i2s_write(I2S_PORT_OUT, responseAudio + offset, toWrite, &written, portMAX_DELAY);
+  if (err != ESP_OK || written == 0) {
+    Serial.printf("[ERROR] i2s_write failed at offset %u, err: %d\n", offset, err);
+    break;
+  }
+  offset += written;
+  yield();
+}
+
+  Serial.println("Playback complete. Cleaning up...");
+
+  i2s_driver_uninstall(I2S_PORT_OUT);
+  free(responseAudio);
+  responseAudio = nullptr;
+  responseAudioLen = 0;
   memset(audioBuffer, 0, audioLen);
   audioLen = 0;
 }
+
+// ---------------- MASTER FUNCTION --------------------
+void sendToServer(camera_fb_t* fb) {
+  if (!ensureWiFiConnected()) {
+    cleanupBuffers(fb);
+    return;
+  }
+
+  WiFiClient client;
+  if (!client.connect(serverHost, serverPort)) {
+    Serial.println("Connection to server failed.");
+    cleanupBuffers(fb);
+    return;
+  }
+
+  sendMultipartRequest(client, fb);
+
+  // Return image buffer here after sending request (not earlier)
+  esp_camera_fb_return(fb);
+  fb = nullptr;  // Mark as returned
+
+  readServerResponse(client);
+  client.stop();
+
+  playWavResponse();
+
+  // After playback, cleanup audio buffer
+  if (responseAudio) {
+    free(responseAudio);
+    responseAudio = nullptr;
+    responseAudioLen = 0;
+  }
+
+  memset(audioBuffer, 0, audioLen);
+  audioLen = 0;
+}
+
 
 void setup() {
   Serial.begin(115200);
@@ -386,7 +489,6 @@ void loop() {
   static bool buttonPressed = false;
   unsigned long now = millis();
 
-  // Check for button press (active LOW with INPUT_PULLUP)
   if (digitalRead(BUTTON_PIN) == LOW && (now - lastButtonPress > 500)) {
     buttonPressed = true;
     lastButtonPress = now;
@@ -394,6 +496,9 @@ void loop() {
 
   if (buttonPressed) {
     Serial.println("Button trigger starting...");
+
+    // Clean buffers before new capture
+    cleanupBuffers(nullptr);
 
     camera_fb_t* fb = captureImage();
     if (fb) {
@@ -407,5 +512,5 @@ void loop() {
     buttonPressed = false;
   }
 
-  delay(50); // Small delay for stability and watchdog
+  delay(50);
 }
